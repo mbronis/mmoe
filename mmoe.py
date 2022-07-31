@@ -1,9 +1,8 @@
 import itertools
-from typing import Tuple
+from typing import List, Tuple, Union
 
 import tensorflow as tf
 import tensorflow.keras as K
-from keras.layers import concatenate
 from keras.models import Model
 
 
@@ -77,16 +76,21 @@ def buld_mmoe_model(
     experts_shape: Tuple[int],
     experts_activation: str,
     tasks_num: int,
+    tasks_shape: Tuple[int],
+    tasks_activation: str,
+    tasks_activation_head: Union[str, List[str]],
 ):
     seed_generator = itertools.count()
 
     inputs = K.Input(shape=n_inputs, name="inputs")
-    core_model = build_core(
-        inputs=inputs, shape=core_shape, activation=core_activation, seed=next(seed_generator)
-    )
+
+    # core block
+    core = build_core(inputs=inputs, shape=core_shape, activation=core_activation, seed=next(seed_generator))
+
+    # experts & gates
     experts = [
         build_expert(
-            inputs=core_model,
+            inputs=core,
             shape=experts_shape,
             activation=experts_activation,
             name=f"expert_{i}",
@@ -96,19 +100,39 @@ def buld_mmoe_model(
     ]
 
     gates = [
-        build_gate(inputs=core_model, name=f"gate_{i}", experts_num=experts_num, seed=next(seed_generator))
+        build_gate(inputs=core, name=f"gate_{i}", experts_num=experts_num, seed=next(seed_generator))
         for i in range(tasks_num)
     ]
 
-    # prepare input for task blocks
+    # input for task blocks
+    # for each task average experts_out with relevant gate
     experts = tf.stack(experts, axis=1)  # -> (batch_size, experts_num, experts_out)
     gates = tf.stack(gates, axis=1)  # -> (batch_size, tasks_num, experts_num)
+    weighted_experts_out = tf.einsum(
+        "bij, bki -> bkj", experts, gates
+    )  # -> (batch_size, tasks_num, experts_out)
 
-    # for each task average experts_out with relevant gate
-    # -> (batch_size, tasks_num, experts_out)
-    weighted_experts_out = tf.einsum("bij, bki -> bkj", experts, gates)
-    weighted_experts_out = [weighted_experts_out[:, task_num, :] for task_num in range(tasks_num)]
+    # task blocks
+    if isinstance(tasks_activation_head, str):
+        tasks_activation_head = [tasks_activation_head] * tasks_num
+    if isinstance(tasks_shape, tuple):
+        tasks_shape = [tasks_shape] * tasks_num
+    tasks = [
+        build_mlp_block(
+            inputs=task_inputs,
+            shape=task_shape,
+            activation=tasks_activation,
+            activation_head=task_activation_head,
+            name=f"task_{task_no}",
+            seed=next(seed_generator),
+        )
+        for task_no, (task_inputs, task_shape, task_activation_head) in enumerate(
+            zip(
+                [weighted_experts_out[:, task_num, :] for task_num in range(tasks_num)],
+                tasks_shape,
+                tasks_activation_head,
+            )
+        )
+    ]
 
-    mmoe_model = Model(inputs, weighted_experts_out, name="mmoe")
-
-    return mmoe_model
+    return Model(inputs, tasks, name="mmoe")
